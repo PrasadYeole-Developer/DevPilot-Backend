@@ -20,5 +20,10 @@ google-genai==3.0.0
 # --- Vector storage ---
 pinecone==10.3.0
 
+# --- Conversation persistence & long-term memory (MongoDB Atlas) ---
+pymongo==4.19.0
+langgraph-checkpoint-mongodb==0.5.1
+langgraph-store-mongodb==0.4.0
+
 # --- Testing ---
 pytest==9.2.0

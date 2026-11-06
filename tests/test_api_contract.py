@@ -47,11 +47,13 @@ def test_chat_endpoint_response_shape(monkeypatch, sample_store, fake_search_ser
 
     assert response.status_code == 200
     body = response.json()
-    # Milestone 5 contract (answer, sources) unchanged; tool_calls is additive.
-    assert set(body.keys()) == {"answer", "sources", "tool_calls"}
+    # Milestone 5 contract (answer, sources) unchanged; tool_calls (M5) and
+    # thread_id (M7) are additive fields existing clients can ignore.
+    assert set(body.keys()) == {"answer", "sources", "tool_calls", "thread_id"}
     assert isinstance(body["answer"], str) and body["answer"]
     assert isinstance(body["sources"], list)
     assert isinstance(body["tool_calls"], list)
+    assert body["thread_id"] is None  # no thread_id was requested -> ephemeral, as in Milestone 5
 
 
 def test_chat_endpoint_requires_ingested_repository(monkeypatch):

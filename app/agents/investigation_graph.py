@@ -29,6 +29,7 @@ with the rest of the agent module.
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -47,8 +48,24 @@ DEFAULT_MAX_INVESTIGATION_ROUNDS = 3
 
 
 def build_investigation_graph(
-    chat_model: BaseChatModel, tools: list[BaseTool], store: RepositoryStore
+    chat_model: BaseChatModel,
+    tools: list[BaseTool],
+    store: RepositoryStore,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
+    """
+    checkpointer: Milestone 7 addition. None (the default) preserves exact
+    Milestone 6 behavior. When provided, the full investigation conversation
+    (understand_bug through generate_report) is persisted per `thread_id` for
+    later history retrieval via GET /api/v1/conversations/{thread_id}.
+
+    Note: unlike the chat graph, a checkpointed investigation thread is never
+    resumed mid-workflow by this graph itself — app.api.routes.investigate
+    always clears any prior checkpoint for a reused thread_id before invoking,
+    since this workflow has no valid "continue where it left off" state (it
+    runs start-to-finish in one call). The checkpointer here exists purely so
+    a finished investigation's full message trace can be reviewed later.
+    """
     bound_model = chat_model.bind_tools(tools)
 
     graph = StateGraph(InvestigationState)
@@ -103,7 +120,7 @@ def build_investigation_graph(
     graph.add_edge("analyze_root_cause", "generate_report")
     graph.add_edge("generate_report", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def _route_after_verification(state: InvestigationState) -> str:

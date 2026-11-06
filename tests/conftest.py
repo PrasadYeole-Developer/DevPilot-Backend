@@ -129,3 +129,124 @@ class ScriptedChatModel:
     async def ainvoke(self, messages):
         self.tool_call_count += 1
         return next(self._tool_responses)
+
+
+# --- Milestone 7: fake Mongo-ish infrastructure ---
+#
+# No real MongoDB and no mongomock dependency: these are minimal in-memory
+# stand-ins for exactly the pymongo Collection methods / langgraph.store
+# BaseStore methods our own code actually calls, so tests exercise our
+# logic (ConversationStore, LongTermMemoryService, route ownership checks)
+# without depending on MongoDB's wire protocol at all.
+
+
+class _FakeCursor:
+    def __init__(self, docs: list[dict]):
+        self._docs = docs
+
+    def sort(self, field, direction):
+        self._docs = sorted(self._docs, key=lambda d: d.get(field), reverse=(direction == -1))
+        return self
+
+    def skip(self, n):
+        self._docs = self._docs[n:]
+        return self
+
+    def limit(self, n):
+        self._docs = self._docs[:n]
+        return self
+
+    def __iter__(self):
+        return iter(self._docs)
+
+
+class FakeCollection:
+    """Minimal in-memory stand-in for a pymongo Collection — just enough for ConversationStore."""
+
+    def __init__(self):
+        self.docs: dict[str, dict] = {}
+
+    def insert_one(self, document: dict):
+        self.docs[document["_id"]] = dict(document)
+
+    def find_one(self, query: dict):
+        doc = self.docs.get(query.get("_id"))
+        return dict(doc) if doc else None
+
+    def find(self, query: dict):
+        matched = [dict(d) for d in self.docs.values() if all(d.get(k) == v for k, v in query.items())]
+        return _FakeCursor(matched)
+
+    def count_documents(self, query: dict) -> int:
+        return sum(1 for d in self.docs.values() if all(d.get(k) == v for k, v in query.items()))
+
+    def update_one(self, query: dict, update: dict):
+        doc = self.docs.get(query.get("_id"))
+        if doc:
+            doc.update(update.get("$set", {}))
+
+    def delete_one(self, query: dict):
+        existed = query.get("_id") in self.docs
+        self.docs.pop(query.get("_id"), None)
+
+        class _Result:
+            deleted_count = 1 if existed else 0
+
+        return _Result()
+
+
+@pytest.fixture
+def fake_conversations_collection() -> FakeCollection:
+    return FakeCollection()
+
+
+class _FakeStoreItem:
+    def __init__(self, key, value, updated_at):
+        self.key = key
+        self.value = value
+        self.updated_at = updated_at
+
+
+class FakeLongTermStore:
+    """
+    Minimal in-memory stand-in for langgraph.store.base.BaseStore (aget/aput/
+    asearch/adelete only). Validates namespace segments the same way the real
+    MongoDBStore does (no "/" in any segment) — a live Atlas test caught a
+    real bug (repository_id="owner/repo" used as a single namespace segment)
+    that this fake originally let slide silently; it now replicates that
+    check so the offline suite would catch the same class of bug.
+    """
+
+    def __init__(self):
+        self.data: dict[tuple, dict[str, dict]] = {}
+
+    def _validate_namespace(self, namespace: tuple) -> None:
+        for part in namespace:
+            if "/" in part:
+                raise ValueError(f"Namespace parts must not contain the separator '/'. Got namespace: {namespace}")
+
+    async def aget(self, namespace: tuple, key: str):
+        self._validate_namespace(namespace)
+        bucket = self.data.get(namespace, {})
+        if key not in bucket:
+            return None
+        return _FakeStoreItem(key, bucket[key], updated_at=None)
+
+    async def aput(self, namespace: tuple, key: str, value: dict, index=None, **kwargs):
+        self._validate_namespace(namespace)
+        self.data.setdefault(namespace, {})[key] = dict(value)
+
+    async def asearch(self, namespace_prefix: tuple, *, query=None, filter=None, limit=10, offset=0, **kwargs):
+        self._validate_namespace(namespace_prefix)
+        bucket = self.data.get(namespace_prefix, {})
+        items = [_FakeStoreItem(k, v, updated_at=None) for k, v in bucket.items()]
+        return items[offset : offset + limit]
+
+    async def adelete(self, namespace: tuple, key: str):
+        self._validate_namespace(namespace)
+        self.data.get(namespace, {}).pop(key, None)
+
+
+@pytest.fixture
+def fake_long_term_store() -> FakeLongTermStore:
+    return FakeLongTermStore()

@@ -77,6 +77,18 @@ class Settings(BaseSettings):
     # since this graph has more stages and can legitimately run longer.
     investigation_recursion_limit: int = Field(default=60)
 
+    # --- MongoDB Atlas (Milestone 7: conversation persistence + long-term memory) ---
+    # Optional: when unset, /chat and /investigate stay fully ephemeral (identical
+    # to Milestones 5/6 behavior) and the /conversations endpoints return 503.
+    mongodb_uri: Optional[str] = Field(default=None)
+    mongodb_database: str = Field(default="devpilot")
+    mongodb_connect_timeout_ms: int = Field(default=5000)
+    mongodb_server_selection_timeout_ms: int = Field(default=5000)
+
+    # --- Conversations (pagination) ---
+    conversation_list_default_limit: int = Field(default=20)
+    conversation_list_max_limit: int = Field(default=100)
+
 
 @lru_cache
 def get_settings() -> Settings:

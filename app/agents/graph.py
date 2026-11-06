@@ -22,21 +22,39 @@ node execution.
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from app.agents.nodes.agent_node import agent_node
+from app.agents.nodes.agent_node import SYSTEM_PROMPT, agent_node
 from app.agents.state import AgentState
 
 
-def build_agent_graph(chat_model: BaseChatModel, tools: list[BaseTool]) -> CompiledStateGraph:
+def build_agent_graph(
+    chat_model: BaseChatModel,
+    tools: list[BaseTool],
+    checkpointer: BaseCheckpointSaver | None = None,
+    extra_context: str | None = None,
+) -> CompiledStateGraph:
+    """
+    checkpointer: Milestone 7 addition. None (the default) preserves exact
+    Milestone 5 behavior — an uncompiled-with-memory, single-shot graph. When
+    provided (a MongoDBSaver in production), LangGraph persists/restores
+    `messages` per `thread_id` passed via `config={"configurable": {...}}`
+    on invoke.
+
+    extra_context: Milestone 7 addition. Appended to the default system
+    prompt — used to inject relevant long-term memories for this repository
+    without changing agent_node itself or losing its base behavioral rules.
+    """
     bound_model = chat_model.bind_tools(tools)
+    system_prompt = SYSTEM_PROMPT if not extra_context else f"{SYSTEM_PROMPT}\n\n{extra_context}"
 
     graph = StateGraph(AgentState)
 
     async def _agent(state: AgentState) -> dict:
-        return await agent_node(state, chat_model=bound_model)
+        return await agent_node(state, chat_model=bound_model, system_prompt=system_prompt)
 
     graph.add_node("agent", _agent)
     # handle_tool_errors=True: any exception raised by a tool (bad args, path
@@ -49,4 +67,4 @@ def build_agent_graph(chat_model: BaseChatModel, tools: list[BaseTool]) -> Compi
     graph.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
     graph.add_edge("tools", "agent")
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

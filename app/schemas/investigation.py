@@ -8,7 +8,7 @@ investigation graph's nodes, and the FastAPI request/response contract for
 set of "internal" shapes.
 """
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +17,11 @@ from app.schemas.chat import ToolCallRecord
 
 class InvestigateRequest(BaseModel):
     bug_report: str = Field(..., min_length=1, description="Free-text description of the reported bug.")
+    # Milestone 7, additive: omit for the original Milestone 6 ephemeral behavior.
+    # Passing an existing investigation thread_id starts a fresh investigation
+    # under that same conversation record (see app.api.routes.investigate for why
+    # investigation threads are always reset rather than resumed).
+    thread_id: Optional[str] = Field(default=None)
 
 
 class BugUnderstanding(BaseModel):
@@ -107,3 +112,5 @@ class InvestigationResponse(BaseModel):
     recommended_fix_direction: str
     remaining_unknowns: list[str] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+    # Milestone 7, additive: echoes the thread_id used, or None if ephemeral.
+    thread_id: Optional[str] = Field(default=None)
