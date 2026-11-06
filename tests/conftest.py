@@ -161,12 +161,19 @@ class _FakeCursor:
 
 
 class FakeCollection:
-    """Minimal in-memory stand-in for a pymongo Collection — just enough for ConversationStore."""
+    """
+    Minimal in-memory stand-in for a pymongo Collection — just enough for
+    ConversationStore/ProposalStore/ProposalAuditStore's actual method calls.
+    """
 
     def __init__(self):
         self.docs: dict[str, dict] = {}
+        self._auto_id = 0
 
     def insert_one(self, document: dict):
+        if "_id" not in document:
+            self._auto_id += 1
+            document = {**document, "_id": self._auto_id}
         self.docs[document["_id"]] = dict(document)
 
     def find_one(self, query: dict):
@@ -184,6 +191,17 @@ class FakeCollection:
         doc = self.docs.get(query.get("_id"))
         if doc:
             doc.update(update.get("$set", {}))
+
+    def replace_one(self, query: dict, replacement: dict, upsert: bool = False):
+        existed = query.get("_id") in self.docs
+        if existed or upsert:
+            self.docs[query["_id"]] = dict(replacement)
+
+        class _Result:
+            matched_count = 1 if existed else 0
+            upserted_id = None if existed else query.get("_id")
+
+        return _Result()
 
     def delete_one(self, query: dict):
         existed = query.get("_id") in self.docs

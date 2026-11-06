@@ -40,8 +40,15 @@ a long-term, cross-conversation memory of confirmed repository findings. See "Co
 persistence & memory" below. Entirely optional: without `MONGODB_URI` set, every other
 milestone's behavior is byte-for-byte unchanged.
 
-Multi-agent workflows, code modification, GitHub write access, and a frontend are not
-implemented yet.
+Milestone 8 complete: human-in-the-loop code-change proposals — DevPilot investigates a
+bug, proposes a minimal fix as a unified diff, and **pauses for real human approval**
+using LangGraph's actual interrupt/resume mechanism before anything is "applied." See
+"Human-in-the-loop code-change proposals" below.
+
+Multi-agent workflows, GitHub write access, and a frontend are not implemented yet.
+Code changes are proposed and can be "applied" as a reviewable artifact, but are never
+written to GitHub, never committed, and never pushed — see the limitations in that
+section.
 
 ## Stack
 
@@ -64,16 +71,19 @@ app/
       chat.py                    POST /api/v1/chat (now with optional thread_id persistence)
       investigate.py             POST /api/v1/investigate (now with optional thread_id persistence)
       conversations.py           POST/GET /api/v1/conversations, GET/DELETE /api/v1/conversations/{thread_id}
+      proposals.py               POST /api/v1/proposals, GET/.../approve/.../reject/.../diff
   agents/
     state.py                     AgentState: messages (Annotated with add_messages) + repository_id
     investigation_state.py       InvestigationState: bug report/plan/evidence/report fields + messages
+    proposal_state.py            ProposalState: investigation report/draft/validation/decision fields
     message_utils.py             Shared helpers: final_answer, collect_search_sources, collect_tool_calls
     model.py                     Cached ChatGoogleGenerativeAI factory (reused across requests)
     graph.py                     Chat agent graph: START -> agent <-> tools -> END (optional checkpointer)
     investigation_graph.py       Investigation workflow graph (see "Bug investigation" below)
+    proposal_graph.py            HITL proposal graph (see "Human-in-the-loop code-change proposals" below)
     nodes/
       agent_node.py              Node: invokes Gemini (tools bound) on the running conversation;
-                                  reused by both the chat agent and the investigator
+                                  reused by the chat agent, the investigator, and (indirectly) proposals
       understand_bug.py          Node: interprets the bug report (expected/actual behavior, keywords)
       plan_investigation.py      Node: turns that understanding into a focused investigation plan
       investigate_code.py        Node: the ReAct investigator (agent_node + investigator prompt)
@@ -81,6 +91,11 @@ app/
       continue_investigation.py  Node: feeds missing-evidence guidance back into another round
       analyze_root_cause.py      Node: root-cause analysis, confirmed findings vs. hypotheses
       generate_report.py         Node: pure assembly of the final report (no LLM call)
+      investigate_bug.py         Node: reuses the whole investigation graph as a nested run
+      generate_proposal.py       Node: drafts a minimal fix from confirmed findings (structured output)
+      validate_proposal.py       Node: independent, deterministic, server-side patch validation
+      request_human_approval.py  Node: the actual LangGraph interrupt() — pauses for a human decision
+      apply_patch.py             Node: re-checks staleness, marks APPLIED (no filesystem writes)
     tools/
       search_codebase.py         Tool: semantic search via the existing RepositorySearchService
       list_repository_files.py   Tool: lists eligible file paths, optional prefix filter
@@ -100,6 +115,8 @@ app/
     pinecone_service.py          Async Pinecone client (index lifecycle, upsert, query)
     conversation_store.py        Conversation metadata CRUD (the `conversations` collection)
     memory_store.py              Long-term memory (LongTermMemoryService over MongoDBStore)
+    patch_service.py             Diff generation + independent server-side patch validation
+    proposal_store.py            Proposal + append-only audit-trail persistence
   schemas/
     repository.py                Request/response models for repository ingestion
     indexing.py                  Response model for repository indexing
@@ -107,6 +124,7 @@ app/
     chat.py                      Request/response models for the chat endpoint
     investigation.py             Request/response models for bug investigation
     conversation.py              Request/response models for conversation management
+    proposal.py                  Request/response models for code-change proposals
 tests/
   conftest.py                    Shared fixtures incl. fake Mongo collection/store, InMemorySaver use
   test_investigation_workflow.py Offline tests for the investigation graph (mocked Gemini/Pinecone)
@@ -119,6 +137,9 @@ tests/
   test_conversations_api.py      /api/v1/conversations endpoints end-to-end
   test_chat_api_persistence.py   /api/v1/chat with thread_id end-to-end
   test_investigate_api_persistence.py  /api/v1/investigate with thread_id end-to-end
+  test_patch_service.py          Diff generation, path traversal/file-creation/staleness rejection
+  test_proposal_graph.py         The real interrupt/Command(resume=...) mechanism, incl. restart simulation
+  test_proposals_api.py          /api/v1/proposals endpoints end-to-end incl. audit history
 ```
 
 ## Bug investigation
@@ -411,6 +432,203 @@ originating `thread_id` in `source` for audit purposes regardless.
   grow its context window usage unbounded.
 - Plain chat conversations don't themselves write long-term memories (only completed
   investigations do) — a deliberate scope boundary for this milestone, not a bug.
+
+## Human-in-the-loop code-change proposals
+
+`POST /api/v1/proposals` takes a bug report and runs investigation through to a
+proposed fix — but the fix is never applied without a real, separate human decision.
+The developer stays in control of every code modification: a proposal pauses at an
+actual LangGraph interrupt and stays paused in MongoDB until `/approve` or `/reject` is
+called explicitly. Unlike chat/investigate, this workflow has **no ephemeral mode** —
+pausing for approval only means something if the pause can actually be persisted, so
+MongoDB is required here.
+
+### Architecture
+
+```
+START -> investigate_bug
+             |
+  (status != FAILED)              (status == FAILED, e.g. investigation was inconclusive)
+             v                                  v
+     generate_proposal                         END
+             |
+      validate_proposal
+             |
+  (status != FAILED)              (status == FAILED, e.g. path/size/extension violation)
+             v                                  v
+  request_human_approval                       END
+   [INTERRUPT -- pauses here;
+    resumes via Command(resume=...)]
+             |
+  (decision == "approved")        (decision == "rejected" -- status already REJECTED)
+             v                                  v
+       apply_patch                             END
+             v
+            END
+```
+
+1. **investigate_bug** — reuses Milestone 6's entire investigation graph as a nested
+   run (not duplicated logic — a direct call to `build_investigation_graph(...).ainvoke(...)`).
+   If the investigation doesn't reach a *confirmed* root cause (status `"complete"`),
+   the proposal graph stops immediately with `status: FAILED` — **a fix is never drafted
+   from a hypothesis alone**.
+2. **generate_proposal** — asks Gemini for the smallest reasonable fix, grounded only in
+   `confirmed_findings` (hypotheses are passed along as explicitly unverified context,
+   never as something to fix). Gathers the real original content of the investigation's
+   `affected_files` directly from the repository store first; if Gemini says it needs to
+   see another file, one bounded extra context pass happens before the final draft — not
+   an open-ended tool-calling loop. Output is structured (`ProposalDraft`): per-file
+   `proposed_content` (the complete new file, not a snippet), an explanation, risk level,
+   and explicit assumptions. **No diff is ever requested from or trusted from the LLM.**
+3. **validate_proposal** — no LLM call. Independent, deterministic, server-side
+   validation (`app/services/patch_service.py`): every unified diff is computed here from
+   `(original, proposed)` content; every file path is checked against the exact,
+   known set of files in the currently ingested repository (structurally identical to how
+   `read_repository_file` prevents traversal — there's no filesystem path at all, only
+   exact-match lookups, so `"../../etc/passwd"` or an absolute path simply matches
+   nothing); unsupported file types, file creation, duplicate files, and oversized diffs
+   are all rejected. A proposal that fails here never reaches a human at all.
+4. **request_human_approval** — the real `langgraph.types.interrupt()`, not a simulated
+   boolean. The graph genuinely pauses — `graph.ainvoke(...)` returns with a
+   `"__interrupt__"` key instead of completing, and the paused state is persisted via the
+   `MongoDBSaver` checkpointer. There is no code path from here to `apply_patch` without
+   this pause actually happening: it's the gate itself, not a check guarding it.
+5. **apply_patch** — only reachable from the "approved" branch; the graph's own structure
+   (not a flag) guarantees a rejected or still-pending proposal can never reach it. Before
+   marking `APPLIED`, it re-checks every file's content hash against what's currently
+   ingested — if the repository changed since the proposal was drafted, it fails as stale
+   rather than applying a patch against content that no longer matches.
+
+### LangGraph interrupt/resume, concretely
+
+```python
+# inside request_human_approval_node — paraphrased
+decision_payload = interrupt({"proposal_id": ..., "risk_level": ..., "affected_files": [...]})
+# ^ on first run: raises internally, LangGraph persists state via the checkpointer,
+#   and graph.ainvoke(...) returns normally with a "__interrupt__" key in its result.
+# ^ on resume (Command(resume={"decision": "approved", "reason": "..."})):
+#   interrupt(...) returns that dict immediately, and the rest of the node runs.
+decision = decision_payload["decision"]
+```
+
+Resuming:
+```python
+await graph.ainvoke(
+    Command(resume={"decision": "approved", "reason": "Looks correct."}),
+    config={"configurable": {"thread_id": proposal_id}},
+)
+```
+
+Everything in the node *before* the `interrupt()` call re-runs on resume too — this node
+has nothing before it but the interrupt call itself, which is safe by construction (see
+the module docstring in `app/agents/nodes/request_human_approval.py`).
+
+### MongoDB's role here
+
+The same `MongoDBSaver` checkpointer from Milestone 7, nothing new: pausing is just a
+checkpoint like any other, and resuming is just loading it back and continuing. The
+`proposals` collection (API-facing document: diff, validation results, status, decision)
+and `proposal_audit` collection (append-only event log) are separate from the checkpoint
+internals — same decoupling as the `conversations` collection vs. chat/investigation
+checkpoints in Milestone 7, so API responses never expose raw checkpoint documents.
+
+### API endpoints
+
+```
+POST   /api/v1/proposals                    Investigate + draft a proposal; pauses at approval
+GET    /api/v1/proposals                    List the caller's proposals (paginated)
+GET    /api/v1/proposals/{proposal_id}      Retrieve a proposal
+GET    /api/v1/proposals/{proposal_id}/diff Retrieve just the unified diff
+POST   /api/v1/proposals/{proposal_id}/approve   Resume the paused graph with "approved"
+POST   /api/v1/proposals/{proposal_id}/reject    Resume the paused graph with "rejected"
+```
+
+Every proposal gets its own freshly-generated `thread_id` (equal to `proposal_id` by
+design — there's no reuse semantic here the way chat/investigate threads have, since a
+proposal's lifecycle only ever happens once). Ownership (404, not 403, on mismatch — see
+Milestone 7) and repository-consistency (409 if the currently ingested repository has
+changed since the proposal was created) are both checked before any decision is acted on.
+
+**A decision can only be made once.** `/approve` and `/reject` both check the proposal is
+still `PENDING_APPROVAL` *before ever touching the graph* — a proposal that's already
+`APPROVED`/`REJECTED`/`APPLIED`/`FAILED` gets a clean `409`, never a re-run. This is what
+prevents replaying or duplicating a decision, independent of the graph's own structural
+guarantee that a rejected branch can never reach `apply_patch`.
+
+### Example
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/proposals \
+  -H "Content-Type: application/json" -H "X-Session-Id: dev-1" \
+  -d '{"bug_report": "Deactivated staff members can still access the application after their account is disabled."}'
+```
+```json
+{
+  "proposal_id": "41e5...c1", "thread_id": "41e5...c1", "repository_id": "octocat/Spoon-Knife",
+  "root_cause": "The layout uses rigid, fixed-width CSS properties without responsive constraints.",
+  "explanation": "...", "risk_level": "low",
+  "proposed_changes": [{
+    "file_path": "styles.css", "original_content_hash": "027fb1...",
+    "unified_diff": "--- a/styles.css\n+++ b/styles.css\n@@ ...\n-  width:384px;\n+  max-width: 384px;\n+  width: 100%;\n ...",
+    "change_summary": "Replaced fixed widths with max-width to allow responsive scaling."
+  }],
+  "validation_results": {"valid": true, "issues": []},
+  "status": "PENDING_APPROVAL", "decision": null
+}
+```
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/proposals/41e5...c1/approve \
+  -H "Content-Type: application/json" -H "X-Session-Id: dev-1" \
+  -d '{"reason": "Looks correct, approving."}'
+# -> same body, "status": "APPLIED", "decision": "approved"
+
+curl -X POST http://127.0.0.1:8000/api/v1/proposals/41e5...c1/approve \
+  -H "X-Session-Id: dev-1" -d '{}'
+# -> 409: already decided, not re-applied
+```
+
+### Safe application — what "applying" actually means
+
+DevPilot ingests repositories through the GitHub REST API into an in-memory
+`RepositoryStore` (Milestone 2) — **there is no writable Git working directory**, and
+this milestone does not invent one. "Applying" a patch here means:
+1. Re-verifying the proposal isn't stale (the file's content hash still matches what's
+   currently ingested).
+2. Marking the proposal `APPLIED`.
+
+The "applied" result **is** the proposal's own `proposed_content`/`unified_diff` —
+retrievable via `GET /api/v1/proposals/{id}` and `.../diff` — an approved-patch artifact,
+not a mutation of anything. **The original ingested repository snapshot is never
+written to.** There is no filesystem write, no shell execution, no running of repository
+code, and — critically — **no GitHub write access, no commit, and no push, at any
+point.** Getting an approved change into the real repository remains a manual step for
+the developer (e.g. applying the diff locally and opening a PR themselves).
+
+### Audit history
+
+Every proposal creation, validation outcome, decision, and apply result is recorded as
+an append-only event in `proposal_audit` (`created`, `pending_approval` /
+`validation_failed`, `approved` / `rejected`, `applied` / `apply_failed`) — approving or
+rejecting a proposal updates the `proposals` document's status but never overwrites or
+removes a prior audit entry.
+
+### Known limitations
+
+- No real Git working directory — "applying" is an artifact (diff + full new file
+  content), not a file-system or repository mutation. See "Safe application" above.
+- No new-file creation or deletion support — only modifications to files already present
+  in the ingested repository are supported, by design (`validate_proposal` rejects
+  anything else as `unknown_file`).
+- `generate_proposal`'s "read additional files" capability is one bounded extra context
+  pass, not an open-ended ReAct tool-calling loop — sufficient for small, scoped fixes,
+  but not for a fix that turns out to need iterative exploration across many files.
+- Proposals have no expiry/TTL yet — `ProposalStatus.EXPIRED` exists in the schema for
+  future use but nothing currently transitions a proposal into it.
+- After a real process restart, the in-memory `RepositoryStore` (Milestone 2) is empty —
+  approving a pending proposal requires re-ingesting the same repository first, even
+  though the proposal itself survives the restart intact in MongoDB. This was confirmed
+  directly: approval correctly fails closed (409, not a wrong-repository apply) until the
+  repository is re-ingested.
 
 ## Setup
 

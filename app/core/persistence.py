@@ -16,11 +16,14 @@ from app.core.config import Settings
 from app.core.mongodb import mongodb_manager
 from app.services.conversation_store import ConversationStore
 from app.services.memory_store import LongTermMemoryService
+from app.services.proposal_store import ProposalAuditStore, ProposalStore
 
 CHECKPOINT_COLLECTION = "checkpoints"
 CHECKPOINT_WRITES_COLLECTION = "checkpoint_writes"
 CONVERSATIONS_COLLECTION = "conversations"
 MEMORIES_COLLECTION = "memories"
+PROPOSALS_COLLECTION = "proposals"
+PROPOSAL_AUDIT_COLLECTION = "proposal_audit"
 
 
 def get_checkpointer(settings: Settings) -> MongoDBSaver:
@@ -41,3 +44,13 @@ def get_memory_service(settings: Settings) -> LongTermMemoryService:
     collection = mongodb_manager.database[MEMORIES_COLLECTION]
     store = MongoDBStore(collection=collection)
     return LongTermMemoryService(store)
+
+
+def get_proposal_store(settings: Settings) -> ProposalStore:
+    collection = mongodb_manager.database[PROPOSALS_COLLECTION]
+    return ProposalStore(collection)
+
+
+def get_proposal_audit_store(settings: Settings) -> ProposalAuditStore:
+    collection = mongodb_manager.database[PROPOSAL_AUDIT_COLLECTION]
+    return ProposalAuditStore(collection)

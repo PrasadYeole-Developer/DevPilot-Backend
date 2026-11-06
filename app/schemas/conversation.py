@@ -5,7 +5,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-ConversationWorkflow = Literal["chat", "investigation"]
+ConversationWorkflow = Literal["chat", "investigation", "proposal"]
 
 
 class ConversationCreateRequest(BaseModel):

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.routes import chat, conversations, health, investigate, repositories
+from app.api.routes import chat, conversations, health, investigate, proposals, repositories
 from app.core.config import get_settings
 from app.core.mongodb import MongoDBConnectionError, mongodb_manager
 
@@ -57,6 +57,7 @@ app.include_router(repositories.router)
 app.include_router(chat.router)
 app.include_router(investigate.router)
 app.include_router(conversations.router)
+app.include_router(proposals.router)
 
 
 @app.get("/")
