@@ -19,6 +19,12 @@ class ProposalStatus(str, Enum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
     APPLIED = "APPLIED"
+    # The GitHub write sequence got partway through (at minimum a branch
+    # exists) but did not fully succeed -- e.g. the commit/push succeeded but
+    # PR creation failed. Distinct from APPLIED, which requires every step
+    # including PR creation to have actually succeeded, and distinct from
+    # FAILED, which means nothing was written to GitHub in this attempt.
+    APPLY_FAILED = "APPLY_FAILED"
     FAILED = "FAILED"
     EXPIRED = "EXPIRED"
 
@@ -98,6 +104,29 @@ class ValidationResult(BaseModel):
     issues: list[ValidationIssue] = Field(default_factory=list)
 
 
+class ApplyResult(BaseModel):
+    """
+    Structured outcome of apply_patch_node's GitHub write sequence (Milestone 9).
+
+    Populated incrementally and returned even on failure: whatever actually
+    got created on GitHub before a failure (e.g. a branch, or a branch +
+    commit) is preserved here so a partial failure is never reported as if
+    nothing happened, and never silently claimed as a full success either.
+    """
+
+    branch_name: Optional[str] = None
+    base_branch: Optional[str] = None
+    base_commit_sha: Optional[str] = None
+    commit_sha: Optional[str] = None
+    pull_request_number: Optional[int] = None
+    pull_request_url: Optional[str] = None
+    pull_request_state: Optional[str] = None
+    succeeded: bool = Field(
+        default=False, description="True only if every step, including PR creation, completed."
+    )
+    error: Optional[str] = None
+
+
 class ProposalResponse(BaseModel):
     """Final structured proposal — both the `proposals` collection document shape and the API response body."""
 
@@ -115,9 +144,12 @@ class ProposalResponse(BaseModel):
     risk_level: Optional[Literal["low", "medium", "high"]] = None
     validation_results: ValidationResult = Field(default_factory=lambda: ValidationResult(valid=False))
     status: ProposalStatus
-    error: Optional[str] = Field(default=None, description="Set when status is FAILED.")
+    error: Optional[str] = Field(default=None, description="Set when status is FAILED or APPLY_FAILED.")
     decision: Optional[Literal["approved", "rejected"]] = None
     decision_reason: Optional[str] = None
+    apply_result: Optional[ApplyResult] = Field(
+        default=None, description="Set once apply_patch_node has run (status APPLIED or APPLY_FAILED)."
+    )
     created_at: datetime
     updated_at: datetime
 

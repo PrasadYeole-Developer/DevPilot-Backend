@@ -120,6 +120,7 @@ def _proposal_from_result(
         error=state.get("error"),
         decision=state.get("decision"),
         decision_reason=state.get("decision_reason"),
+        apply_result=state.get("apply_result"),
         created_at=now,
         updated_at=now,
     )
@@ -169,6 +170,7 @@ async def create_proposal(
         tools=tools,
         store=repository_store,
         checkpointer=checkpointer,
+        settings=settings,
         investigation_max_rounds=settings.investigation_max_rounds,
         investigation_recursion_limit=settings.investigation_recursion_limit,
     )
@@ -186,6 +188,7 @@ async def create_proposal(
         "decision_reason": None,
         "status": "DRAFT",
         "error": None,
+        "apply_result": None,
     }
     config = {
         "configurable": {"thread_id": proposal_id},
@@ -341,6 +344,7 @@ async def _decide(
         tools=tools,
         store=repository_store,
         checkpointer=checkpointer,
+        settings=settings,
         investigation_max_rounds=settings.investigation_max_rounds,
         investigation_recursion_limit=settings.investigation_recursion_limit,
     )
@@ -365,9 +369,27 @@ async def _decide(
         audit_store = get_proposal_audit_store(settings)
         await audit_store.record(proposal_id, decision, session_id, {"reason": reason})
         if proposal.status == ProposalStatus.APPLIED:
-            await audit_store.record(proposal_id, "applied", session_id, {})
-        elif proposal.status == ProposalStatus.FAILED:
-            await audit_store.record(proposal_id, "apply_failed", session_id, {"error": proposal.error})
+            await audit_store.record(
+                proposal_id,
+                "applied",
+                session_id,
+                {
+                    "branch_name": proposal.apply_result.branch_name if proposal.apply_result else None,
+                    "commit_sha": proposal.apply_result.commit_sha if proposal.apply_result else None,
+                    "pull_request_url": proposal.apply_result.pull_request_url if proposal.apply_result else None,
+                },
+            )
+        elif proposal.status in (ProposalStatus.APPLY_FAILED, ProposalStatus.FAILED):
+            await audit_store.record(
+                proposal_id,
+                "apply_failed",
+                session_id,
+                {
+                    "error": proposal.error,
+                    "branch_name": proposal.apply_result.branch_name if proposal.apply_result else None,
+                    "commit_sha": proposal.apply_result.commit_sha if proposal.apply_result else None,
+                },
+            )
         conversation_store = get_conversation_store(settings)
         await conversation_store.touch(proposal_id, status=proposal.status.value)
     except (MongoDBConnectionError, ProposalStoreError, ConversationStoreError) as exc:

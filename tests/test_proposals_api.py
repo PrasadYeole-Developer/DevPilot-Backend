@@ -9,6 +9,7 @@ way as elsewhere. No real network calls are made.
 
 import asyncio
 
+import app.agents.nodes.apply_patch as apply_patch_module
 import app.api.routes.proposals as proposals_module
 import pytest
 from fastapi.testclient import TestClient
@@ -21,8 +22,9 @@ from app.main import app as fastapi_app
 from app.schemas.investigation import BugUnderstanding, EvidenceAssessment, InvestigationPlan, RootCauseAnalysis
 from app.schemas.proposal import ProposalDraft, ProposedFileChangeDraft
 from app.services.conversation_store import ConversationStore
+from app.services.github_write_client import GitHubWriteClient
 from app.services.proposal_store import ProposalAuditStore, ProposalStore
-from tests.conftest import FakeCollection, ScriptedChatModel
+from tests.conftest import FakeCollection, FakeGitHubWriteClient, ScriptedChatModel
 
 BUG_REPORT = "Deactivated staff members can still access the application after their account is disabled."
 
@@ -93,18 +95,20 @@ def _clear_dependency_overrides():
     fastapi_app.dependency_overrides.clear()
 
 
-def _settings_with_mongo() -> Settings:
+def _settings_with_mongo(*, github_write_token: str | None = "fake-write-token") -> Settings:
     real = get_settings()
-    return Settings(**{**real.model_dump(), "mongodb_uri": "mongodb://fake"})
+    return Settings(**{**real.model_dump(), "mongodb_uri": "mongodb://fake", "github_write_token": github_write_token})
 
 
-def _patch_everything(monkeypatch, sample_store, fake_search_service, chat_model):
+def _patch_everything(monkeypatch, sample_store, fake_search_service, chat_model, *, write_client=None):
     fastapi_app.dependency_overrides[get_settings] = _settings_with_mongo
 
     conversations = FakeCollection()
     proposals = FakeCollection()
     audit = FakeCollection()
     checkpointer = InMemorySaver()
+    write_client = write_client if write_client is not None else FakeGitHubWriteClient()
+    write_client.seed_default_branch("main", commit_sha="base-sha-1", tree_sha="base-tree-1")
 
     monkeypatch.setattr(proposals_module, "repository_store", sample_store)
     monkeypatch.setattr(proposals_module, "EmbeddingService", _DummyService)
@@ -115,8 +119,12 @@ def _patch_everything(monkeypatch, sample_store, fake_search_service, chat_model
     monkeypatch.setattr(proposals_module, "get_checkpointer", lambda settings: checkpointer)
     monkeypatch.setattr(proposals_module, "get_proposal_store", lambda settings: ProposalStore(proposals))
     monkeypatch.setattr(proposals_module, "get_proposal_audit_store", lambda settings: ProposalAuditStore(audit))
+    # apply_patch_node imports GitHubWriteClient at module level (same
+    # convention as EmbeddingService/PineconeService above) -- never a real
+    # GitHub call in these tests.
+    monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", lambda **kwargs: write_client)
 
-    return conversations, proposals, audit, checkpointer
+    return conversations, proposals, audit, checkpointer, write_client
 
 
 # --- 7. Proposal persistence; creation reaches PENDING_APPROVAL ---
@@ -269,7 +277,7 @@ def test_approved_patch_does_not_mutate_original_repository(monkeypatch, sample_
 
 
 def test_audit_history_records_creation_and_decision(monkeypatch, sample_store, fake_search_service):
-    _, _, audit_collection, _ = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
+    _, _, audit_collection, _, _ = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
     fastapi_app.dependency_overrides[get_session_id] = lambda: "session-a"
     client = TestClient(fastapi_app)
 
@@ -286,3 +294,90 @@ def test_audit_history_records_creation_and_decision(monkeypatch, sample_store, 
     assert "applied" in events
     # Append-only: the "created" record is still there after later events.
     assert events[0] == "created"
+
+
+# --- Milestone 9: GitHubWriteClient integration ---
+
+
+def test_approval_missing_write_token_fails_without_any_github_call(monkeypatch, sample_store, fake_search_service):
+    _, _, _, _, write_client = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
+    # Undo the fake for this one test: use the REAL GitHubWriteClient class,
+    # so a missing token is caught by its own constructor, not by the fake.
+    monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", GitHubWriteClient)
+    fastapi_app.dependency_overrides[get_settings] = lambda: _settings_with_mongo(github_write_token=None)
+    fastapi_app.dependency_overrides[get_session_id] = lambda: "session-a"
+    client = TestClient(fastapi_app)
+
+    proposal_id = client.post("/api/v1/proposals", json={"bug_report": BUG_REPORT}).json()["proposal_id"]
+    response = client.post(f"/api/v1/proposals/{proposal_id}/approve", json={"reason": "ok"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "FAILED"
+    assert "GITHUB_WRITE_TOKEN" in body["error"]
+    assert body["apply_result"] is None
+    assert write_client.calls == []  # the fake was swapped out; nothing on it was ever called either way
+
+
+def test_approval_resume_performs_github_writes_exactly_once(monkeypatch, sample_store, fake_search_service):
+    _, _, _, _, write_client = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
+    fastapi_app.dependency_overrides[get_session_id] = lambda: "session-a"
+    client = TestClient(fastapi_app)
+    proposal_id = client.post("/api/v1/proposals", json={"bug_report": BUG_REPORT}).json()["proposal_id"]
+
+    first = client.post(f"/api/v1/proposals/{proposal_id}/approve", json={"reason": "ok"})
+    assert first.status_code == 200
+    assert first.json()["status"] == "APPLIED"
+    calls_after_first = list(write_client.calls)
+    assert len(calls_after_first) > 0
+
+    second = client.post(f"/api/v1/proposals/{proposal_id}/approve", json={"reason": "again"})
+    assert second.status_code == 409  # already decided -- the graph is never even re-invoked
+
+    # No additional GitHub write/read calls happened on the second attempt.
+    assert write_client.calls == calls_after_first
+
+
+def test_persisted_proposal_contains_branch_commit_and_pr_details(monkeypatch, sample_store, fake_search_service):
+    _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
+    fastapi_app.dependency_overrides[get_session_id] = lambda: "session-a"
+    client = TestClient(fastapi_app)
+    proposal_id = client.post("/api/v1/proposals", json={"bug_report": BUG_REPORT}).json()["proposal_id"]
+
+    approved = client.post(f"/api/v1/proposals/{proposal_id}/approve", json={"reason": "ok"})
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPLIED"
+
+    # Round-tripped through ProposalStore -- GET fetches it back from the
+    # fake Mongo collection, not from the in-memory response object.
+    fetched = client.get(f"/api/v1/proposals/{proposal_id}")
+    assert fetched.status_code == 200
+    apply_result = fetched.json()["apply_result"]
+    assert apply_result is not None
+    assert apply_result["branch_name"] == f"devpilot/proposal-{proposal_id}"
+    assert apply_result["base_branch"] == "main"
+    assert apply_result["commit_sha"] is not None
+    assert apply_result["pull_request_number"] is not None
+    assert apply_result["pull_request_url"] is not None
+    assert apply_result["succeeded"] is True
+
+
+def test_pr_creation_failure_preserves_branch_and_commit_details(monkeypatch, sample_store, fake_search_service):
+    failing_client = FakeGitHubWriteClient(fail_at="create_pull_request")
+    _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model(), write_client=failing_client)
+    fastapi_app.dependency_overrides[get_session_id] = lambda: "session-a"
+    client = TestClient(fastapi_app)
+    proposal_id = client.post("/api/v1/proposals", json={"bug_report": BUG_REPORT}).json()["proposal_id"]
+
+    response = client.post(f"/api/v1/proposals/{proposal_id}/approve", json={"reason": "ok"})
+    assert response.status_code == 200
+    body = response.json()
+
+    # Never falsely reported as a full success.
+    assert body["status"] == "APPLY_FAILED"
+    assert "pull request" in body["error"].lower()
+    apply_result = body["apply_result"]
+    assert apply_result["branch_name"] == f"devpilot/proposal-{proposal_id}"
+    assert apply_result["commit_sha"] is not None  # the commit was pushed before PR creation failed
+    assert apply_result["pull_request_number"] is None
+    assert apply_result["succeeded"] is False

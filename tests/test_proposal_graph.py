@@ -8,6 +8,7 @@ check. All Gemini calls are mocked via ScriptedChatModel; Pinecone search is
 bypassed via FakeSearchService.
 """
 
+import app.agents.nodes.apply_patch as apply_patch_module
 import pytest
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -15,9 +16,10 @@ from langgraph.types import Command
 
 from app.agents.proposal_graph import build_proposal_graph
 from app.agents.tools import build_tools
+from app.core.config import Settings
 from app.schemas.investigation import BugUnderstanding, EvidenceAssessment, InvestigationPlan, RootCauseAnalysis
 from app.schemas.proposal import ProposalDraft, ProposedFileChangeDraft
-from tests.conftest import ScriptedChatModel
+from tests.conftest import FakeGitHubWriteClient, ScriptedChatModel
 
 pytestmark = pytest.mark.anyio
 
@@ -78,9 +80,22 @@ def _happy_path_responses() -> dict:
     }
 
 
-def _build_graph(chat_model, store, search_service, checkpointer):
+def _settings(write_token: str | None = "fake-write-token") -> Settings:
+    # _env_file=None: deterministic regardless of this machine's real .env --
+    # these graph tests must never depend on (or accidentally use) a real
+    # GITHUB_WRITE_TOKEN.
+    return Settings(_env_file=None, github_write_token=write_token)
+
+
+def _build_graph(chat_model, store, search_service, checkpointer, settings=None):
     tools = build_tools(search_service=search_service, store=store)
-    return build_proposal_graph(chat_model=chat_model, tools=tools, store=store, checkpointer=checkpointer)
+    return build_proposal_graph(
+        chat_model=chat_model, tools=tools, store=store, checkpointer=checkpointer, settings=settings or _settings()
+    )
+
+
+def _explode_if_constructed(*_args, **_kwargs):
+    raise AssertionError("GitHubWriteClient must never be constructed for a rejected/pending proposal.")
 
 
 def _initial_state(proposal_id: str, repository_id: str, bug_report: str) -> dict:
@@ -97,6 +112,7 @@ def _initial_state(proposal_id: str, repository_id: str, bug_report: str) -> dic
         "decision_reason": None,
         "status": "DRAFT",
         "error": None,
+        "apply_result": None,
     }
 
 
@@ -158,7 +174,7 @@ async def test_no_proposal_generated_from_inconclusive_investigation(sample_stor
 # --- 9/11. Missing approval never applies changes; approved workflow resumes and applies ---
 
 
-async def test_approved_decision_resumes_and_applies(sample_store, fake_search_service):
+async def test_approved_decision_resumes_and_applies(sample_store, fake_search_service, monkeypatch):
     model = ScriptedChatModel(
         structured_responses=_happy_path_responses(),
         tool_responses=[_read_call("app/auth/deactivate.py"), _summary("Confirmed.")],
@@ -173,11 +189,34 @@ async def test_approved_decision_resumes_and_applies(sample_store, fake_search_s
 
     original_before = next(f.content for f in sample_store.get_current().files if f.path == "app/auth/deactivate.py")
 
+    fake_write_client = FakeGitHubWriteClient()
+    fake_write_client.seed_default_branch("main", commit_sha="base-sha-1", tree_sha="base-tree-1")
+    monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", lambda **kwargs: fake_write_client)
+
     result = await graph.ainvoke(Command(resume={"decision": "approved", "reason": "looks good"}), config=config)
 
     assert "__interrupt__" not in result
     assert result["decision"] == "approved"
     assert result["status"] == "APPLIED"
+
+    # A real (fake-backed) branch/commit/PR sequence actually ran.
+    apply_result = result["apply_result"]
+    assert apply_result.branch_name == "devpilot/proposal-prop-3"
+    assert apply_result.commit_sha is not None
+    assert apply_result.pull_request_number is not None
+    assert apply_result.pull_request_url is not None
+    assert apply_result.succeeded is True
+    call_names = [name for name, _ in fake_write_client.calls]
+    assert call_names == [
+        "get_branch_head_commit_sha",
+        "create_branch",
+        "get_commit",
+        "create_blob",
+        "create_tree",
+        "create_commit",
+        "update_branch_reference",
+        "create_pull_request",
+    ]
 
     # 16. The original ingested repository snapshot is never mutated.
     original_after = next(f.content for f in sample_store.get_current().files if f.path == "app/auth/deactivate.py")
@@ -188,7 +227,12 @@ async def test_approved_decision_resumes_and_applies(sample_store, fake_search_s
 # --- 10. Rejected workflow never applies changes ---
 
 
-async def test_rejected_decision_never_applies(sample_store, fake_search_service):
+async def test_rejected_decision_never_applies(sample_store, fake_search_service, monkeypatch):
+    # If apply_patch_node were ever (incorrectly) reached for a rejected
+    # proposal, constructing GitHubWriteClient would raise immediately --
+    # proving both "never applies" and "never makes a real GitHub call".
+    monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", _explode_if_constructed)
+
     model = ScriptedChatModel(
         structured_responses=_happy_path_responses(),
         tool_responses=[_read_call("app/auth/deactivate.py"), _summary("Confirmed.")],
@@ -212,7 +256,7 @@ async def test_rejected_decision_never_applies(sample_store, fake_search_service
 # --- 19. Restart simulation: a new graph object, same checkpointer, resumes correctly ---
 
 
-async def test_resume_works_after_simulated_restart(sample_store, fake_search_service):
+async def test_resume_works_after_simulated_restart(sample_store, fake_search_service, monkeypatch):
     """
     Every real request builds a brand-new graph object (see
     app/api/routes/proposals.py) -- there is never a long-lived graph
@@ -241,6 +285,10 @@ async def test_resume_works_after_simulated_restart(sample_store, fake_search_se
 
     state = await graph_after_restart.aget_state(config)
     assert state.next == ("request_human_approval",), "paused state must survive across independent graph objects"
+
+    fake_write_client = FakeGitHubWriteClient()
+    fake_write_client.seed_default_branch("main", commit_sha="base-sha-1", tree_sha="base-tree-1")
+    monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", lambda **kwargs: fake_write_client)
 
     result = await graph_after_restart.ainvoke(Command(resume={"decision": "approved", "reason": None}), config=config)
 

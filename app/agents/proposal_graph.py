@@ -48,6 +48,7 @@ from app.agents.nodes.investigate_bug import investigate_bug_node
 from app.agents.nodes.request_human_approval import request_human_approval_node
 from app.agents.nodes.validate_proposal import validate_proposal_node
 from app.agents.proposal_state import ProposalState
+from app.core.config import Settings
 from app.ingestion.store import RepositoryStore
 
 DEFAULT_INVESTIGATION_MAX_ROUNDS = 3
@@ -59,6 +60,7 @@ def build_proposal_graph(
     tools: list[BaseTool],
     store: RepositoryStore,
     checkpointer: BaseCheckpointSaver,
+    settings: Settings,
     investigation_max_rounds: int = DEFAULT_INVESTIGATION_MAX_ROUNDS,
     investigation_recursion_limit: int = DEFAULT_INVESTIGATION_RECURSION_LIMIT,
 ) -> CompiledStateGraph:
@@ -80,8 +82,8 @@ def build_proposal_graph(
     def _validate_proposal(state: ProposalState) -> dict:
         return validate_proposal_node(state, store=store)
 
-    def _apply_patch(state: ProposalState) -> dict:
-        return apply_patch_node(state, store=store)
+    async def _apply_patch(state: ProposalState) -> dict:
+        return await apply_patch_node(state, store=store, settings=settings)
 
     graph.add_node("investigate_bug", _investigate_bug)
     graph.add_node("generate_proposal", _generate_proposal)

@@ -39,6 +39,18 @@ class Settings(BaseSettings):
     github_max_files: int = Field(default=500)
     github_max_concurrent_requests: int = Field(default=10)
 
+    # --- GitHub (write operations: branches, commits, pull requests) ---
+    # Deliberately separate from github_token above: a read-only deployment
+    # must never end up holding a token capable of mutating a repository.
+    # Needs a token with 'repo' scope (classic PAT) or Contents: Read & write
+    # + Pull requests: Read & write (fine-grained PAT). Unset by default --
+    # GitHubWriteClient raises a clear configuration error rather than
+    # silently falling back to github_token.
+    github_write_token: Optional[str] = Field(default=None)
+    github_write_timeout_seconds: float = Field(default=15.0)
+    github_bot_name: str = Field(default="DevPilot Bot")
+    github_bot_email: str = Field(default="devpilot-bot@users.noreply.github.com")
+
     # --- Google GenAI ---
     google_api_key: Optional[str] = Field(default=None)
     google_embedding_model: str = Field(default="gemini-embedding-001")

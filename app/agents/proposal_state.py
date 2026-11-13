@@ -14,7 +14,7 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 
 from app.schemas.investigation import InvestigationResponse
-from app.schemas.proposal import ProposalDraft, ProposedFileChange, ValidationResult
+from app.schemas.proposal import ApplyResult, ProposalDraft, ProposedFileChange, ValidationResult
 
 
 class ProposalState(TypedDict):
@@ -38,3 +38,4 @@ class ProposalState(TypedDict):
 
     status: str  # mirrors ProposalStatus.value
     error: Optional[str]
+    apply_result: Optional[ApplyResult]  # set by apply_patch_node (status APPLIED or APPLY_FAILED)

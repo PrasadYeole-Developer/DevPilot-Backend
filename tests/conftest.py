@@ -1,11 +1,14 @@
 """Shared fixtures for offline tests — no real Gemini, Pinecone, or GitHub calls."""
 
 import itertools
+from typing import Any, Optional
 
 import pytest
 
 from app.ingestion.store import IngestedRepository, RepositoryStore, RetrievedFile
 from app.retrieval.search_service import SearchMatch
+from app.services.github_client import GitHubAPIError
+from app.services.github_write_client import GitHubBranchExistsError, PullRequestResult
 
 
 @pytest.fixture
@@ -268,3 +271,108 @@ class FakeLongTermStore:
 @pytest.fixture
 def fake_long_term_store() -> FakeLongTermStore:
     return FakeLongTermStore()
+
+
+# --- Milestone 9: fake GitHubWriteClient -- no real GitHub writes in tests ---
+
+
+class FakeGitHubWriteClient:
+    """
+    Deterministic, in-memory stand-in for GitHubWriteClient -- same async
+    context manager + method shapes, zero real network calls. Records every
+    call made (for "never called on rejection" / "exactly once" assertions)
+    and can be told to fail at a specific step to exercise apply_patch_node's
+    partial-failure handling.
+    """
+
+    def __init__(self, *, fail_at: Optional[str] = None, fail_message: str = "simulated GitHub failure"):
+        self.calls: list[tuple[str, tuple]] = []
+        self._branches: dict[str, dict[str, Any]] = {}
+        self._commits: dict[str, dict[str, Any]] = {}
+        self._fail_at = fail_at
+        self._fail_message = fail_message
+        self._next_id = itertools.count(1)
+        self._next_pr_number = itertools.count(101)
+
+    def seed_default_branch(self, branch_name: str, commit_sha: str, tree_sha: str) -> None:
+        self._branches[branch_name] = commit_sha
+        self._commits[commit_sha] = {"sha": commit_sha, "tree": {"sha": tree_sha}, "parents": [], "message": ""}
+
+    def seed_existing_branch(
+        self, branch_name: str, commit_sha: str, tree_sha: str, parent_sha: str, message: str
+    ) -> None:
+        self._branches[branch_name] = commit_sha
+        self._commits[commit_sha] = {
+            "sha": commit_sha,
+            "tree": {"sha": tree_sha},
+            "parents": [{"sha": parent_sha}],
+            "message": message,
+        }
+
+    async def __aenter__(self) -> "FakeGitHubWriteClient":
+        return self
+
+    async def __aexit__(self, *_exc_info) -> None:
+        return None
+
+    def _maybe_fail(self, step: str) -> None:
+        if self._fail_at == step:
+            raise GitHubAPIError(self._fail_message, status_code=500)
+
+    async def get_branch_head_commit_sha(self, owner: str, repo: str, branch_name: str) -> str:
+        self.calls.append(("get_branch_head_commit_sha", (owner, repo, branch_name)))
+        self._maybe_fail("get_branch_head_commit_sha")
+        if branch_name not in self._branches:
+            from app.services.github_client import GitHubNotFoundError
+
+            raise GitHubNotFoundError(f"Not found: refs/heads/{branch_name}", status_code=404)
+        return self._branches[branch_name]
+
+    async def get_commit(self, owner: str, repo: str, commit_sha: str) -> dict[str, Any]:
+        self.calls.append(("get_commit", (owner, repo, commit_sha)))
+        self._maybe_fail("get_commit")
+        return self._commits[commit_sha]
+
+    async def create_branch(self, owner: str, repo: str, branch_name: str, base_sha: str) -> dict[str, Any]:
+        self.calls.append(("create_branch", (owner, repo, branch_name, base_sha)))
+        self._maybe_fail("create_branch")
+        if branch_name in self._branches:
+            raise GitHubBranchExistsError(f"Branch 'refs/heads/{branch_name}' already exists.", status_code=422)
+        self._branches[branch_name] = base_sha
+        return {"ref": f"refs/heads/{branch_name}", "object": {"sha": base_sha}}
+
+    async def create_blob(self, owner: str, repo: str, content: str) -> str:
+        self.calls.append(("create_blob", (owner, repo, content)))
+        self._maybe_fail("create_blob")
+        return f"blob-sha-{next(self._next_id)}"
+
+    async def create_tree(self, owner: str, repo: str, base_tree_sha: str, files: list) -> str:
+        self.calls.append(("create_tree", (owner, repo, base_tree_sha, tuple(files))))
+        self._maybe_fail("create_tree")
+        return f"tree-sha-{next(self._next_id)}"
+
+    async def create_commit(self, owner: str, repo: str, message: str, tree_sha: str, parent_sha: str) -> str:
+        self.calls.append(("create_commit", (owner, repo, message, tree_sha, parent_sha)))
+        self._maybe_fail("create_commit")
+        sha = f"commit-sha-{next(self._next_id)}"
+        self._commits[sha] = {
+            "sha": sha,
+            "tree": {"sha": tree_sha},
+            "parents": [{"sha": parent_sha}],
+            "message": message,
+        }
+        return sha
+
+    async def update_branch_reference(self, owner: str, repo: str, branch_name: str, commit_sha: str) -> dict[str, Any]:
+        self.calls.append(("update_branch_reference", (owner, repo, branch_name, commit_sha)))
+        self._maybe_fail("update_branch_reference")
+        self._branches[branch_name] = commit_sha
+        return {"ref": f"refs/heads/{branch_name}", "object": {"sha": commit_sha}}
+
+    async def create_pull_request(
+        self, owner: str, repo: str, title: str, body: str, head_branch: str, base_branch: str
+    ) -> PullRequestResult:
+        self.calls.append(("create_pull_request", (owner, repo, title, body, head_branch, base_branch)))
+        self._maybe_fail("create_pull_request")
+        number = next(self._next_pr_number)
+        return PullRequestResult(number=number, url=f"https://github.com/{owner}/{repo}/pull/{number}", state="open")
