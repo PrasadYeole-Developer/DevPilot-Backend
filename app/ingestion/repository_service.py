@@ -67,16 +67,23 @@ class RepositoryIngestionService:
         retrieved_files, fetch_skipped, errors = await self._fetch_contents(owner, repo, eligible)
         skipped.extend(fetch_skipped)
 
+        skipped_files_truncated = len(skipped) > MAX_SKIPPED_FILES_IN_RESPONSE
+        skipped_files_in_response = skipped[:MAX_SKIPPED_FILES_IN_RESPONSE]
+
         self._store.save(
             IngestedRepository(
                 owner=owner,
                 repo=repo,
                 default_branch=default_branch,
                 files=retrieved_files,
+                total_files_discovered=total_files_discovered,
+                eligible_files=len(eligible),
+                skipped_files=skipped_files_in_response,
+                skipped_files_truncated=skipped_files_truncated,
+                tree_truncated=tree_truncated,
+                errors=errors,
             )
         )
-
-        skipped_files_truncated = len(skipped) > MAX_SKIPPED_FILES_IN_RESPONSE
 
         return IngestionResult(
             owner=owner,
@@ -85,7 +92,7 @@ class RepositoryIngestionService:
             total_files_discovered=total_files_discovered,
             eligible_files=len(eligible),
             retrieved_files=len(retrieved_files),
-            skipped_files=skipped[:MAX_SKIPPED_FILES_IN_RESPONSE],
+            skipped_files=skipped_files_in_response,
             skipped_files_truncated=skipped_files_truncated,
             tree_truncated=tree_truncated,
             errors=errors,

@@ -10,6 +10,8 @@ here. This is intentionally temporary scaffolding for the next milestone
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from app.ingestion.file_filter import SkippedEntry
+
 
 @dataclass(frozen=True)
 class RetrievedFile:
@@ -26,6 +28,16 @@ class IngestedRepository:
     default_branch: str
     files: list[RetrievedFile] = field(default_factory=list)
     ingested_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Ingestion stats computed once by RepositoryIngestionService.ingest() and
+    # echoed in its response. Kept here too (not just returned over HTTP) so
+    # GET /api/v1/repositories/current can restore the same numbers after a
+    # frontend reload without re-fetching from GitHub or fabricating values.
+    total_files_discovered: int = 0
+    eligible_files: int = 0
+    skipped_files: list[SkippedEntry] = field(default_factory=list)
+    skipped_files_truncated: bool = False
+    tree_truncated: bool = False
+    errors: list[str] = field(default_factory=list)
 
 
 class RepositoryStore:

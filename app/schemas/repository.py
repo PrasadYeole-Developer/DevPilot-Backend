@@ -32,3 +32,18 @@ class IngestRepositoryResponse(BaseModel):
         description="True if GitHub truncated the repository tree (repo too large to list fully).",
     )
     errors: list[str] = Field(default_factory=list)
+
+
+class CurrentRepositoryInfo(IngestRepositoryResponse):
+    """Same shape as IngestRepositoryResponse, plus the derived repository_id
+    the frontend already uses elsewhere (owner/repository)."""
+
+    repository_id: str
+
+
+class CurrentRepositoryResponse(BaseModel):
+    repository: CurrentRepositoryInfo | None = Field(
+        default=None,
+        description="The currently ingested repository, or null if none has been ingested "
+        "(or the backend process has restarted since the last ingest).",
+    )

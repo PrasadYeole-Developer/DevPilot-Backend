@@ -4,6 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import chat, conversations, health, investigate, proposals, repositories
 from app.core.config import get_settings
@@ -50,6 +51,18 @@ app = FastAPI(
     description="AI Developer Assistant that understands a GitHub repository via RAG.",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allowed_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    # The frontend's dev-session bootstrap (app.core.session) reads the
+    # server-minted X-Session-Id back off the response — without exposing it,
+    # browsers only let JS read a small safelisted set of response headers.
+    expose_headers=["X-Session-Id"],
 )
 
 app.include_router(health.router)

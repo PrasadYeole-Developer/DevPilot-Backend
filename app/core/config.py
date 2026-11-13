@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     conversation_list_default_limit: int = Field(default=20)
     conversation_list_max_limit: int = Field(default=100)
 
+    # --- CORS (frontend integration) ---
+    # Comma-separated list of browser origins allowed to call this API.
+    # Defaults to the Vite dev server's default origin so the companion
+    # frontend works without extra setup; override for other dev ports or a
+    # deployed frontend origin.
+    cors_allowed_origins: str = Field(default="http://localhost:5173")
+
+    @property
+    def cors_allowed_origins_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -9,7 +9,13 @@ from app.ingestion.url_parser import InvalidRepositoryURLError
 from app.retrieval.indexing_service import NoRepositoryIngestedError, RepositoryIndexingService
 from app.retrieval.search_service import RepositorySearchService
 from app.schemas.indexing import IndexRepositoryResponse
-from app.schemas.repository import IngestRepositoryRequest, IngestRepositoryResponse, SkippedFile
+from app.schemas.repository import (
+    CurrentRepositoryInfo,
+    CurrentRepositoryResponse,
+    IngestRepositoryRequest,
+    IngestRepositoryResponse,
+    SkippedFile,
+)
 from app.schemas.search import SearchRequest, SearchResponse, SearchResult
 from app.services.embedding_service import (
     EmbeddingRateLimitError,
@@ -20,6 +26,34 @@ from app.services.github_client import GitHubAPIError, GitHubClient, GitHubNotFo
 from app.services.pinecone_service import PineconeService, PineconeServiceError
 
 router = APIRouter(prefix="/api/v1/repositories", tags=["repositories"])
+
+
+@router.get("/current", response_model=CurrentRepositoryResponse)
+async def get_current_repository() -> CurrentRepositoryResponse:
+    """
+    Read-only lookup of whatever RepositoryStore currently holds, so the
+    frontend can restore its repository state after a reload without
+    re-ingesting from GitHub, re-embedding, or touching Pinecone.
+    """
+    repository = repository_store.get_current()
+    if repository is None:
+        return CurrentRepositoryResponse(repository=None)
+
+    return CurrentRepositoryResponse(
+        repository=CurrentRepositoryInfo(
+            owner=repository.owner,
+            repository=repository.repo,
+            repository_id=f"{repository.owner}/{repository.repo}",
+            default_branch=repository.default_branch,
+            total_files_discovered=repository.total_files_discovered,
+            eligible_files=repository.eligible_files,
+            retrieved_files=len(repository.files),
+            skipped_files=[SkippedFile(path=s.path, reason=s.reason) for s in repository.skipped_files],
+            skipped_files_truncated=repository.skipped_files_truncated,
+            tree_truncated=repository.tree_truncated,
+            errors=repository.errors,
+        )
+    )
 
 
 @router.post("/ingest", response_model=IngestRepositoryResponse)
