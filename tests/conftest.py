@@ -8,6 +8,11 @@ import pytest
 from app.ingestion.store import IngestedRepository, RepositoryStore, RetrievedFile
 from app.retrieval.search_service import SearchMatch
 from app.services.github_client import GitHubAPIError
+from app.services.github_mcp_client import (
+    GitHubMCPConnectionError,
+    GitHubMCPTimeoutError,
+    GitHubMCPToolError,
+)
 from app.services.github_write_client import GitHubBranchExistsError, PullRequestResult
 
 
@@ -376,3 +381,55 @@ class FakeGitHubWriteClient:
         self._maybe_fail("create_pull_request")
         number = next(self._next_pr_number)
         return PullRequestResult(number=number, url=f"https://github.com/{owner}/{repo}/pull/{number}", state="open")
+
+
+# --- Milestone 9 Phase 1: fake GitHubMCPClient -- no real MCP calls in tests ---
+
+
+class FakeGitHubMCPClient:
+    """
+    Deterministic stand-in for GitHubMCPClient (app.services.github_mcp_client)
+    -- no real MCP/network calls. `fail_mode` simulates one of
+    GitHubMCPClient's real failure classes:
+
+    - "connect"          -> GitHubMCPConnectionError on __aenter__
+    - "connect_timeout"  -> GitHubMCPTimeoutError on __aenter__
+    - "timeout"          -> GitHubMCPTimeoutError on create_pull_request
+    - "tool_error"       -> GitHubMCPToolError on create_pull_request
+                            (mirrors the real tool reporting is_error=True)
+    - "connection"       -> GitHubMCPConnectionError on create_pull_request
+    - None (default)     -> succeeds
+    """
+
+    def __init__(self, *, fail_mode: Optional[str] = None, fail_message: str = "simulated MCP failure"):
+        self.calls: list[tuple[str, tuple]] = []
+        self.entered = False
+        self._fail_mode = fail_mode
+        self._fail_message = fail_message
+        self._next_pr_number = itertools.count(201)
+
+    async def __aenter__(self) -> "FakeGitHubMCPClient":
+        if self._fail_mode == "connect":
+            raise GitHubMCPConnectionError(self._fail_message)
+        if self._fail_mode == "connect_timeout":
+            raise GitHubMCPTimeoutError(self._fail_message)
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *_exc_info) -> None:
+        self.entered = False
+
+    async def create_pull_request(
+        self, owner: str, repo: str, title: str, body: str, head_branch: str, base_branch: str
+    ) -> PullRequestResult:
+        self.calls.append(("create_pull_request", (owner, repo, title, body, head_branch, base_branch)))
+        if self._fail_mode == "timeout":
+            raise GitHubMCPTimeoutError(self._fail_message)
+        if self._fail_mode == "tool_error":
+            raise GitHubMCPToolError(self._fail_message)
+        if self._fail_mode == "connection":
+            raise GitHubMCPConnectionError(self._fail_message)
+        number = next(self._next_pr_number)
+        return PullRequestResult(
+            number=number, url=f"https://github.com/{owner}/{repo}/pull/{number}", state="open"
+        )

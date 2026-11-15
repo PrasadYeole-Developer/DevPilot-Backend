@@ -51,6 +51,19 @@ class Settings(BaseSettings):
     github_bot_name: str = Field(default="DevPilot Bot")
     github_bot_email: str = Field(default="devpilot-bot@users.noreply.github.com")
 
+    # --- GitHub (MCP server connection -- pull-request creation only) ---
+    # Phase 1 of the GitHub-to-MCP migration: ONLY create_pull_request goes
+    # through the official remote GitHub MCP server. Every other GitHub
+    # operation (branches, blobs, trees, commits, refs, repo/tree/blob reads)
+    # stays on the REST clients above -- see app.services.github_mcp_client's
+    # module docstring for why (verified from the server's own source:
+    # no SHA-pinned branch creation, no bot commit identity, get_commit
+    # exposes neither tree nor parent SHAs, for those other operations).
+    # Reuses github_write_token -- same credential, same trust boundary as
+    # the existing write-scoped REST client; not a new credential surface.
+    github_mcp_server_url: str = Field(default="https://api.githubcopilot.com/mcp/")
+    github_mcp_timeout_seconds: float = Field(default=30.0)
+
     # --- Google GenAI ---
     google_api_key: Optional[str] = Field(default=None)
     google_embedding_model: str = Field(default="gemini-embedding-001")

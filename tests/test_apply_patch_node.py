@@ -4,10 +4,11 @@ real GitHub branch/commit/PR creation after human approval).
 
 Exercises the node directly (not through the full proposal graph or API) so
 every branch of its partial-failure handling is cheap and precise to test.
-GitHubWriteClient is always either the FakeGitHubWriteClient test double
-(tests/conftest.py) or, for the "missing token" case, the real class
+GitHubWriteClient (branch/blob/tree/commit/ref) is always either
+FakeGitHubWriteClient or, for the "missing token" case, the real class
 constructed with no token (still no network call -- it raises before one
-would ever be attempted).
+would ever be attempted). GitHubMCPClient (PR creation only) is always
+FakeGitHubMCPClient -- no real MCP connection is ever made in these tests.
 """
 
 import app.agents.nodes.apply_patch as apply_patch_module
@@ -18,7 +19,7 @@ from app.core.config import Settings
 from app.ingestion.store import IngestedRepository, RepositoryStore, RetrievedFile
 from app.schemas.proposal import ProposedFileChange
 from app.services.patch_service import hash_content
-from tests.conftest import FakeGitHubWriteClient
+from tests.conftest import FakeGitHubMCPClient, FakeGitHubWriteClient
 
 pytestmark = pytest.mark.anyio
 
@@ -81,8 +82,18 @@ def _fake_client(monkeypatch, **kwargs) -> FakeGitHubWriteClient:
     return client
 
 
+def _fake_mcp_client(monkeypatch, **kwargs) -> FakeGitHubMCPClient:
+    mcp_client = FakeGitHubMCPClient(**kwargs)
+    monkeypatch.setattr(apply_patch_module, "GitHubMCPClient", lambda **kw: mcp_client)
+    return mcp_client
+
+
 def _explode(*_args, **_kwargs):
     raise AssertionError("GitHubWriteClient must not be constructed for this case.")
+
+
+def _explode_mcp(*_args, **_kwargs):
+    raise AssertionError("GitHubMCPClient must not be constructed for this case.")
 
 
 # --- Success: single and multi-file ---------------------------------------
@@ -91,6 +102,7 @@ def _explode(*_args, **_kwargs):
 async def test_single_file_proposal_succeeds(monkeypatch):
     repo = _repository(**{"a.py": "x = 1\n"})
     client = _fake_client(monkeypatch)
+    mcp_client = _fake_mcp_client(monkeypatch)
     changes = [_change("a.py", "x = 1\n", "x = 2\n")]
 
     result = await apply_patch_node(_state("prop-1", REPOSITORY_ID, changes), store=_store(repo), settings=_settings())
@@ -105,11 +117,15 @@ async def test_single_file_proposal_succeeds(monkeypatch):
     assert apply_result.succeeded is True
     blob_calls = [c for c in client.calls if c[0] == "create_blob"]
     assert len(blob_calls) == 1
+    # PR creation went through the MCP client, not the REST write client.
+    assert not any(c[0] == "create_pull_request" for c in client.calls)
+    assert [c[0] for c in mcp_client.calls] == ["create_pull_request"]
 
 
 async def test_multi_file_proposal_succeeds(monkeypatch):
     repo = _repository(**{"a.py": "x = 1\n", "b.py": "y = 1\n", "c.py": "z = 1\n"})
     client = _fake_client(monkeypatch)
+    _fake_mcp_client(monkeypatch)
     changes = [
         _change("a.py", "x = 1\n", "x = 2\n"),
         _change("b.py", "y = 1\n", "y = 2\n"),
@@ -132,6 +148,7 @@ async def test_multi_file_proposal_succeeds(monkeypatch):
 
 async def test_repository_mismatch_fails_without_any_github_call(monkeypatch):
     monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", _explode)
+    monkeypatch.setattr(apply_patch_module, "GitHubMCPClient", _explode_mcp)
     repo = _repository(**{"a.py": "x = 1\n"})
     changes = [_change("a.py", "x = 1\n", "x = 2\n")]
 
@@ -145,6 +162,7 @@ async def test_repository_mismatch_fails_without_any_github_call(monkeypatch):
 
 async def test_stale_file_prevents_all_writes(monkeypatch):
     monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", _explode)
+    monkeypatch.setattr(apply_patch_module, "GitHubMCPClient", _explode_mcp)
     changes = [_change("a.py", "x = 1\n", "x = 2\n")]
     # The repository now has different content than when the proposal was drafted.
     repo_now = _repository(**{"a.py": "x = 999  # changed since the proposal was drafted\n"})
@@ -158,6 +176,9 @@ async def test_stale_file_prevents_all_writes(monkeypatch):
 async def test_missing_write_token_fails_without_any_github_call():
     # Deliberately NOT monkeypatched -- the real GitHubWriteClient class
     # raises in its own constructor before any network call is possible.
+    # GitHubMCPClient shares the same settings.github_write_token, but its
+    # construction is never even reached: GitHubWriteClient's constructor
+    # raises first, in the same try block.
     repo = _repository(**{"a.py": "x = 1\n"})
     changes = [_change("a.py", "x = 1\n", "x = 2\n")]
 
@@ -176,6 +197,10 @@ async def test_missing_write_token_fails_without_any_github_call():
 async def test_branch_creation_failure_is_plain_failed_not_partial(monkeypatch):
     repo = _repository(**{"a.py": "x = 1\n"})
     client = _fake_client(monkeypatch, fail_at="create_branch")
+    # GitHubMCPClient is always constructed alongside GitHubWriteClient (both
+    # are cheap, no-network-call construction), but must never be entered or
+    # called when the REST sequence fails before the PR step.
+    mcp_client = _fake_mcp_client(monkeypatch)
     changes = [_change("a.py", "x = 1\n", "x = 2\n")]
 
     result = await apply_patch_node(_state("prop-6", REPOSITORY_ID, changes), store=_store(repo), settings=_settings())
@@ -183,6 +208,8 @@ async def test_branch_creation_failure_is_plain_failed_not_partial(monkeypatch):
     # Nothing was ever created on GitHub this attempt -- plain FAILED.
     assert result["status"] == "FAILED"
     assert "Failed to create branch" in result["error"]
+    assert mcp_client.calls == []
+    assert mcp_client.entered is False
 
 
 # --- Failures after the branch exists: APPLY_FAILED, partial state preserved ---
@@ -192,6 +219,7 @@ async def test_branch_creation_failure_is_plain_failed_not_partial(monkeypatch):
 async def test_failure_after_branch_created_is_apply_failed_with_no_commit_sha(monkeypatch, fail_step):
     repo = _repository(**{"a.py": "x = 1\n"})
     client = _fake_client(monkeypatch, fail_at=fail_step)
+    mcp_client = _fake_mcp_client(monkeypatch)
     changes = [_change("a.py", "x = 1\n", "x = 2\n")]
 
     result = await apply_patch_node(_state("prop-7", REPOSITORY_ID, changes), store=_store(repo), settings=_settings())
@@ -202,11 +230,13 @@ async def test_failure_after_branch_created_is_apply_failed_with_no_commit_sha(m
     assert apply_result.commit_sha is None
     assert apply_result.succeeded is False
     assert any(c[0] == "create_branch" for c in client.calls)
+    assert mcp_client.calls == []  # never reached the PR step
 
 
 async def test_ref_update_failure_preserves_commit_sha(monkeypatch):
     repo = _repository(**{"a.py": "x = 1\n"})
     client = _fake_client(monkeypatch, fail_at="update_branch_reference")
+    mcp_client = _fake_mcp_client(monkeypatch)
     changes = [_change("a.py", "x = 1\n", "x = 2\n")]
 
     result = await apply_patch_node(_state("prop-8", REPOSITORY_ID, changes), store=_store(repo), settings=_settings())
@@ -216,11 +246,15 @@ async def test_ref_update_failure_preserves_commit_sha(monkeypatch):
     assert apply_result.commit_sha is not None  # the commit itself was created
     assert apply_result.pull_request_number is None
     assert "moving branch" in result["error"]
+    assert mcp_client.calls == []  # never reached the PR step
 
 
 async def test_pr_creation_failure_after_commit_preserves_branch_and_commit(monkeypatch):
     repo = _repository(**{"a.py": "x = 1\n"})
-    client = _fake_client(monkeypatch, fail_at="create_pull_request")
+    client = _fake_client(monkeypatch)
+    # PR creation now goes through GitHubMCPClient, not GitHubWriteClient --
+    # the failure is injected there.
+    mcp_client = _fake_mcp_client(monkeypatch, fail_mode="tool_error", fail_message="no commits between main and devpilot/proposal-prop-9")
     changes = [_change("a.py", "x = 1\n", "x = 2\n")]
 
     result = await apply_patch_node(_state("prop-9", REPOSITORY_ID, changes), store=_store(repo), settings=_settings())
@@ -232,6 +266,15 @@ async def test_pr_creation_failure_after_commit_preserves_branch_and_commit(monk
     assert apply_result.pull_request_number is None
     assert apply_result.succeeded is False
     assert "pull request creation failed" in result["error"]
+    # The REST client's branch/commit sequence succeeded fully; only the
+    # (separate) MCP call failed.
+    assert not any(c[0] == "create_pull_request" for c in client.calls)
+    mcp_calls = [c for c in mcp_client.calls if c[0] == "create_pull_request"]
+    assert len(mcp_calls) == 1
+    # args tuple is (owner, repo, title, body, head_branch, base_branch)
+    _, _, _, _, head_branch, base_branch = mcp_calls[0][1]
+    assert head_branch == apply_result.branch_name
+    assert base_branch == "main"
 
 
 # --- Existing branch collision: safe reuse vs. refusal ---------------------
@@ -240,6 +283,7 @@ async def test_pr_creation_failure_after_commit_preserves_branch_and_commit(monk
 async def test_existing_branch_safe_to_reuse_continues_to_success(monkeypatch):
     repo = _repository(**{"a.py": "x = 1\n"})
     client = _fake_client(monkeypatch)
+    mcp_client = _fake_mcp_client(monkeypatch)
     branch_name = "devpilot/proposal-prop-10"
     # Pre-seed a branch whose tip commit genuinely belongs to this exact
     # proposal and is based on the current default-branch head.
@@ -257,11 +301,13 @@ async def test_existing_branch_safe_to_reuse_continues_to_success(monkeypatch):
     assert result["status"] == "APPLIED"
     # create_branch was attempted and collided, but the flow continued.
     assert any(c[0] == "create_branch" for c in client.calls)
+    assert [c[0] for c in mcp_client.calls] == ["create_pull_request"]
 
 
 async def test_existing_branch_unrelated_proposal_refuses(monkeypatch):
     repo = _repository(**{"a.py": "x = 1\n"})
     client = _fake_client(monkeypatch)
+    mcp_client = _fake_mcp_client(monkeypatch)
     branch_name = "devpilot/proposal-prop-11"
     client.seed_existing_branch(
         branch_name,
@@ -278,11 +324,13 @@ async def test_existing_branch_unrelated_proposal_refuses(monkeypatch):
     assert "does not reference" in result["error"]
     # Refused before touching any file content.
     assert not any(c[0] == "create_blob" for c in client.calls)
+    assert mcp_client.calls == []
 
 
 async def test_existing_branch_wrong_base_refuses(monkeypatch):
     repo = _repository(**{"a.py": "x = 1\n"})
     client = _fake_client(monkeypatch)
+    mcp_client = _fake_mcp_client(monkeypatch)
     branch_name = "devpilot/proposal-prop-12"
     # Same proposal id in the message, but based on a DIFFERENT (older) commit
     # than the current default-branch head -- default branch has moved on.
@@ -300,6 +348,7 @@ async def test_existing_branch_wrong_base_refuses(monkeypatch):
     assert result["status"] == "FAILED"
     assert "default branch has moved" in result["error"]
     assert not any(c[0] == "create_blob" for c in client.calls)
+    assert mcp_client.calls == []
 
 
 # --- Branch name construction -------------------------------------------
@@ -307,6 +356,7 @@ async def test_existing_branch_wrong_base_refuses(monkeypatch):
 
 async def test_invalid_branch_name_fails_without_any_github_call(monkeypatch):
     monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", _explode)
+    monkeypatch.setattr(apply_patch_module, "GitHubMCPClient", _explode_mcp)
     repo = _repository(**{"a.py": "x = 1\n"})
     changes = [_change("a.py", "x = 1\n", "x = 2\n")]
     # A proposal_id containing characters that would make the derived branch

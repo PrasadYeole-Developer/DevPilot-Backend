@@ -8,12 +8,19 @@ can never reach here.
 
 "Applying" now means: re-validate (repository identity + staleness, since
 time may have passed since generation/validation), then actually create a
-real GitHub branch, commit, and pull request via GitHubWriteClient --
+real GitHub branch and commit via GitHubWriteClient (REST), and finally the
+pull request via GitHubMCPClient (the official GitHub MCP server) --
 *never* touching the repository's default branch directly, never force-
-pushing, never merging. GitHubWriteClient is imported at module level (like
+pushing, never merging. Both clients are imported at module level (like
 every other external service in this codebase, e.g.
 app.api.routes.chat.EmbeddingService) specifically so tests can monkeypatch
-`apply_patch` module's `GitHubWriteClient` name.
+`apply_patch` module's `GitHubWriteClient`/`GitHubMCPClient` names.
+
+Only PR creation goes through MCP (Phase 1 of the GitHub -> MCP migration);
+branch/blob/tree/commit/ref-update all remain on the REST client -- see
+app.services.github_mcp_client's module docstring for why (verified from
+the official server's own source: no SHA-pinned branch creation, no bot
+commit identity, get_commit exposes neither tree nor parent SHAs).
 
 The original RepositoryStore snapshot is never mutated -- GitHub is the only
 thing written to; the in-memory ingested content stays exactly what the
@@ -38,6 +45,7 @@ from app.core.config import Settings
 from app.ingestion.store import RepositoryStore
 from app.schemas.proposal import ApplyResult, ProposedFileChange
 from app.services.github_client import GitHubAPIError
+from app.services.github_mcp_client import GitHubMCPClient, GitHubMCPConfigurationError
 from app.services.github_write_client import (
     GitHubBranchExistsError,
     GitHubWriteClient,
@@ -82,7 +90,12 @@ async def apply_patch_node(state: ProposalState, store: RepositoryStore, setting
             bot_name=settings.github_bot_name,
             bot_email=settings.github_bot_email,
         )
-    except GitHubWriteConfigurationError as exc:
+        mcp_client = GitHubMCPClient(
+            token=settings.github_write_token,
+            server_url=settings.github_mcp_server_url,
+            timeout_seconds=settings.github_mcp_timeout_seconds,
+        )
+    except (GitHubWriteConfigurationError, GitHubMCPConfigurationError) as exc:
         return {"status": "FAILED", "error": str(exc)}
 
     commit_message = _build_commit_message(proposal_id, state, changes)
@@ -170,14 +183,18 @@ async def apply_patch_node(state: ProposalState, store: RepositoryStore, setting
                 f"Commit {commit_sha} was created, but moving branch '{branch_name}' to it failed: {exc}",
             )
 
-        try:
-            pr = await client.create_pull_request(owner, repo, pr_title, pr_body, branch_name, default_branch)
-        except GitHubAPIError as exc:
-            return _partial_failure(
-                branch_name, default_branch, base_commit_sha, commit_sha,
-                f"Branch '{branch_name}' was pushed (commit {commit_sha}), but pull request creation "
-                f"failed: {exc}",
-            )
+    # PR creation is the one step that goes through the GitHub MCP server
+    # (see module docstring) -- a separate connection, opened only now that
+    # the REST client's work (and its httpx connection) is done.
+    try:
+        async with mcp_client:
+            pr = await mcp_client.create_pull_request(owner, repo, pr_title, pr_body, branch_name, default_branch)
+    except GitHubAPIError as exc:
+        return _partial_failure(
+            branch_name, default_branch, base_commit_sha, commit_sha,
+            f"Branch '{branch_name}' was pushed (commit {commit_sha}), but pull request creation "
+            f"failed: {exc}",
+        )
 
     return {
         "status": "APPLIED",

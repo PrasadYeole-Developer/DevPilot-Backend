@@ -10,6 +10,11 @@ python-dotenv==1.2.4
 # --- HTTP client (GitHub REST API) ---
 httpx==0.28.1
 
+# --- MCP client (GitHub pull-request creation only -- Phase 1 migration) ---
+# Connects to the official remote GitHub MCP server (api.githubcopilot.com);
+# every other GitHub operation stays on the REST clients above.
+mcp==2.3.0
+
 # --- LangGraph / LangChain / Gemini ---
 langgraph==1.2.20
 langchain==1.4.9

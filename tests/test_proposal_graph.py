@@ -19,7 +19,7 @@ from app.agents.tools import build_tools
 from app.core.config import Settings
 from app.schemas.investigation import BugUnderstanding, EvidenceAssessment, InvestigationPlan, RootCauseAnalysis
 from app.schemas.proposal import ProposalDraft, ProposedFileChangeDraft
-from tests.conftest import FakeGitHubWriteClient, ScriptedChatModel
+from tests.conftest import FakeGitHubMCPClient, FakeGitHubWriteClient, ScriptedChatModel
 
 pytestmark = pytest.mark.anyio
 
@@ -96,6 +96,10 @@ def _build_graph(chat_model, store, search_service, checkpointer, settings=None)
 
 def _explode_if_constructed(*_args, **_kwargs):
     raise AssertionError("GitHubWriteClient must never be constructed for a rejected/pending proposal.")
+
+
+def _explode_mcp_if_constructed(*_args, **_kwargs):
+    raise AssertionError("GitHubMCPClient must never be constructed for a rejected/pending proposal.")
 
 
 def _initial_state(proposal_id: str, repository_id: str, bug_report: str) -> dict:
@@ -192,6 +196,8 @@ async def test_approved_decision_resumes_and_applies(sample_store, fake_search_s
     fake_write_client = FakeGitHubWriteClient()
     fake_write_client.seed_default_branch("main", commit_sha="base-sha-1", tree_sha="base-tree-1")
     monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", lambda **kwargs: fake_write_client)
+    fake_mcp_client = FakeGitHubMCPClient()
+    monkeypatch.setattr(apply_patch_module, "GitHubMCPClient", lambda **kwargs: fake_mcp_client)
 
     result = await graph.ainvoke(Command(resume={"decision": "approved", "reason": "looks good"}), config=config)
 
@@ -215,8 +221,10 @@ async def test_approved_decision_resumes_and_applies(sample_store, fake_search_s
         "create_tree",
         "create_commit",
         "update_branch_reference",
-        "create_pull_request",
     ]
+    # PR creation went through the MCP client, not the REST write client.
+    mcp_call_names = [name for name, _ in fake_mcp_client.calls]
+    assert mcp_call_names == ["create_pull_request"]
 
     # 16. The original ingested repository snapshot is never mutated.
     original_after = next(f.content for f in sample_store.get_current().files if f.path == "app/auth/deactivate.py")
@@ -232,6 +240,7 @@ async def test_rejected_decision_never_applies(sample_store, fake_search_service
     # proposal, constructing GitHubWriteClient would raise immediately --
     # proving both "never applies" and "never makes a real GitHub call".
     monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", _explode_if_constructed)
+    monkeypatch.setattr(apply_patch_module, "GitHubMCPClient", _explode_mcp_if_constructed)
 
     model = ScriptedChatModel(
         structured_responses=_happy_path_responses(),
@@ -289,6 +298,8 @@ async def test_resume_works_after_simulated_restart(sample_store, fake_search_se
     fake_write_client = FakeGitHubWriteClient()
     fake_write_client.seed_default_branch("main", commit_sha="base-sha-1", tree_sha="base-tree-1")
     monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", lambda **kwargs: fake_write_client)
+    fake_mcp_client = FakeGitHubMCPClient()
+    monkeypatch.setattr(apply_patch_module, "GitHubMCPClient", lambda **kwargs: fake_mcp_client)
 
     result = await graph_after_restart.ainvoke(Command(resume={"decision": "approved", "reason": None}), config=config)
 

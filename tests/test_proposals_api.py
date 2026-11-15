@@ -24,7 +24,7 @@ from app.schemas.proposal import ProposalDraft, ProposedFileChangeDraft
 from app.services.conversation_store import ConversationStore
 from app.services.github_write_client import GitHubWriteClient
 from app.services.proposal_store import ProposalAuditStore, ProposalStore
-from tests.conftest import FakeCollection, FakeGitHubWriteClient, ScriptedChatModel
+from tests.conftest import FakeCollection, FakeGitHubMCPClient, FakeGitHubWriteClient, ScriptedChatModel
 
 BUG_REPORT = "Deactivated staff members can still access the application after their account is disabled."
 
@@ -100,7 +100,7 @@ def _settings_with_mongo(*, github_write_token: str | None = "fake-write-token")
     return Settings(**{**real.model_dump(), "mongodb_uri": "mongodb://fake", "github_write_token": github_write_token})
 
 
-def _patch_everything(monkeypatch, sample_store, fake_search_service, chat_model, *, write_client=None):
+def _patch_everything(monkeypatch, sample_store, fake_search_service, chat_model, *, write_client=None, mcp_client=None):
     fastapi_app.dependency_overrides[get_settings] = _settings_with_mongo
 
     conversations = FakeCollection()
@@ -109,6 +109,7 @@ def _patch_everything(monkeypatch, sample_store, fake_search_service, chat_model
     checkpointer = InMemorySaver()
     write_client = write_client if write_client is not None else FakeGitHubWriteClient()
     write_client.seed_default_branch("main", commit_sha="base-sha-1", tree_sha="base-tree-1")
+    mcp_client = mcp_client if mcp_client is not None else FakeGitHubMCPClient()
 
     monkeypatch.setattr(proposals_module, "repository_store", sample_store)
     monkeypatch.setattr(proposals_module, "EmbeddingService", _DummyService)
@@ -123,8 +124,11 @@ def _patch_everything(monkeypatch, sample_store, fake_search_service, chat_model
     # convention as EmbeddingService/PineconeService above) -- never a real
     # GitHub call in these tests.
     monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", lambda **kwargs: write_client)
+    # PR creation goes through GitHubMCPClient instead (Phase 1 migration) --
+    # same monkeypatch convention, patched at the point of use in apply_patch_module.
+    monkeypatch.setattr(apply_patch_module, "GitHubMCPClient", lambda **kwargs: mcp_client)
 
-    return conversations, proposals, audit, checkpointer, write_client
+    return conversations, proposals, audit, checkpointer, write_client, mcp_client
 
 
 # --- 7. Proposal persistence; creation reaches PENDING_APPROVAL ---
@@ -277,7 +281,7 @@ def test_approved_patch_does_not_mutate_original_repository(monkeypatch, sample_
 
 
 def test_audit_history_records_creation_and_decision(monkeypatch, sample_store, fake_search_service):
-    _, _, audit_collection, _, _ = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
+    _, _, audit_collection, _, _, _ = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
     fastapi_app.dependency_overrides[get_session_id] = lambda: "session-a"
     client = TestClient(fastapi_app)
 
@@ -300,7 +304,7 @@ def test_audit_history_records_creation_and_decision(monkeypatch, sample_store, 
 
 
 def test_approval_missing_write_token_fails_without_any_github_call(monkeypatch, sample_store, fake_search_service):
-    _, _, _, _, write_client = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
+    _, _, _, _, write_client, mcp_client = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
     # Undo the fake for this one test: use the REAL GitHubWriteClient class,
     # so a missing token is caught by its own constructor, not by the fake.
     monkeypatch.setattr(apply_patch_module, "GitHubWriteClient", GitHubWriteClient)
@@ -317,10 +321,14 @@ def test_approval_missing_write_token_fails_without_any_github_call(monkeypatch,
     assert "GITHUB_WRITE_TOKEN" in body["error"]
     assert body["apply_result"] is None
     assert write_client.calls == []  # the fake was swapped out; nothing on it was ever called either way
+    # GitHubWriteClient's constructor raises first (see apply_patch_node), so
+    # GitHubMCPClient is never even constructed in this failure path.
+    assert mcp_client.calls == []
+    assert mcp_client.entered is False
 
 
 def test_approval_resume_performs_github_writes_exactly_once(monkeypatch, sample_store, fake_search_service):
-    _, _, _, _, write_client = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
+    _, _, _, _, write_client, _ = _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model())
     fastapi_app.dependency_overrides[get_session_id] = lambda: "session-a"
     client = TestClient(fastapi_app)
     proposal_id = client.post("/api/v1/proposals", json={"bug_report": BUG_REPORT}).json()["proposal_id"]
@@ -363,8 +371,8 @@ def test_persisted_proposal_contains_branch_commit_and_pr_details(monkeypatch, s
 
 
 def test_pr_creation_failure_preserves_branch_and_commit_details(monkeypatch, sample_store, fake_search_service):
-    failing_client = FakeGitHubWriteClient(fail_at="create_pull_request")
-    _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model(), write_client=failing_client)
+    failing_mcp_client = FakeGitHubMCPClient(fail_mode="tool_error", fail_message="failed to create pull request")
+    _patch_everything(monkeypatch, sample_store, fake_search_service, _happy_path_model(), mcp_client=failing_mcp_client)
     fastapi_app.dependency_overrides[get_session_id] = lambda: "session-a"
     client = TestClient(fastapi_app)
     proposal_id = client.post("/api/v1/proposals", json={"bug_report": BUG_REPORT}).json()["proposal_id"]
